@@ -147,3 +147,15 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build & Dependencies
+dist/
+build/
+node_modules/
+*.local
+*-service-account*.json
