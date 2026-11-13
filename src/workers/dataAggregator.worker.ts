@@ -2,6 +2,7 @@
 import * as XLSX from 'xlsx';
 import type { IngestionProgress } from '../types/kaizen';
 import {
+  ByteStringInterner,
   StreamingKaizenAggregator,
   buildColumnIndexMap,
   splitCsvLine,
@@ -12,6 +13,9 @@ export type WorkerResponseMessage =
   | { type: 'progress'; progress: IngestionProgress }
   | { type: 'complete'; dataset: ReturnType<StreamingKaizenAggregator['finalize']> }
   | { type: 'error'; message: string };
+
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB ArrayBuffer slices
+const PROGRESS_REPORT_STEP_BYTES = 128 * 1024 * 1024; // Post UI progress every 128 MB
 
 self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
   const files = event.data?.files ?? [];
@@ -25,20 +29,24 @@ self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
 
   const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
   const aggregator = new StreamingKaizenAggregator();
+  const interner = new ByteStringInterner(50000);
+  const headerDecoder = new TextDecoder('utf-8');
+  const colStarts = new Int32Array(32);
+  const colEnds = new Int32Array(32);
+
+  // Reusable scratch buffer to avoid allocating 8MB+ arrays on every iteration
+  let scratchBuf = new Uint8Array(CHUNK_SIZE + 65536);
+
   const startTimeMs = performance.now();
   let bytesReadSoFar = 0;
-  let lastProgressAt = 0;
+  let bytesSinceLastReport = 0;
 
-  const emitProgress = (
+  const postProgress = (
     filesProcessed: number,
     currentFileIndex: number,
-    currentFileName: string,
-    force = false
+    currentFileName: string
   ) => {
-    const now = performance.now();
-    if (!force && now - lastProgressAt < 80) return;
-    lastProgressAt = now;
-    const elapsedSec = Math.max(0.05, (now - startTimeMs) / 1000);
+    const elapsedSec = Math.max(0.01, (performance.now() - startTimeMs) / 1000);
     const speedMbPerSec = Number(
       (bytesReadSoFar / (1024 * 1024) / elapsedSec).toFixed(1)
     );
@@ -64,58 +72,168 @@ self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
     for (let fIdx = 0; fIdx < files.length; fIdx += 1) {
       const file = files[fIdx];
       const lower = file.name.toLowerCase();
-      emitProgress(fIdx, fIdx + 1, file.name, true);
+      postProgress(fIdx, fIdx + 1, file.name);
 
       if (lower.endsWith('.csv')) {
-        const reader = file.stream().getReader();
-        const decoder = new TextDecoder('utf-8');
-        let leftover = '';
+        let offset = 0;
+        let leftoverLen = 0;
         let cols: ColumnIndexMap | null = null;
+        let isFirstLine = true;
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
+        while (offset < file.size) {
+          const end = Math.min(offset + CHUNK_SIZE, file.size);
+          const stepBytes = end - offset;
+          const buffer = await file.slice(offset, end).arrayBuffer();
+          const chunk = new Uint8Array(buffer);
 
-          bytesReadSoFar += value.byteLength;
-          const decodedChunk = decoder.decode(value, { stream: true });
-          const text = leftover ? leftover + decodedChunk : decodedChunk;
+          const needed = leftoverLen + chunk.length;
+          if (needed > scratchBuf.length) {
+            const grown = new Uint8Array(needed + 65536);
+            if (leftoverLen > 0) grown.set(scratchBuf.subarray(0, leftoverLen), 0);
+            scratchBuf = grown;
+          }
+          scratchBuf.set(chunk, leftoverLen);
+          const totalLen = needed;
 
           let lineStart = 0;
-          const len = text.length;
+          let colCount = 0;
+          let cStart = 0;
+          let hasQuotes = false;
+          let inQuotes = false;
 
-          while (lineStart < len) {
-            const nlIdx = text.indexOf('\n', lineStart);
-            if (nlIdx === -1) break;
-
-            if (!cols) {
-              const headerLine = text
-                .slice(lineStart, nlIdx)
-                .replace(/^\uFEFF/, '')
-                .trim();
-              if (headerLine) {
-                cols = buildColumnIndexMap(splitCsvLine(headerLine));
+          for (let i = 0; i < totalLen; i += 1) {
+            const b = scratchBuf[i];
+            if (b === 34) {
+              hasQuotes = true;
+              inQuotes = !inQuotes;
+            } else if (b === 44 && !inQuotes && cols) {
+              if (colCount < 32) {
+                colStarts[colCount] = cStart;
+                colEnds[colCount] = i;
+                colCount += 1;
               }
-            } else {
-              aggregator.ingestCsvLineSlice(text, lineStart, nlIdx, cols);
+              cStart = i + 1;
+            } else if (b === 10) {
+              // Found '\n' (10)
+              let lineEnd = i;
+              if (lineEnd > lineStart && scratchBuf[lineEnd - 1] === 13) {
+                lineEnd -= 1; // Strip '\r' (13)
+              }
+
+              if (!cols) {
+                if (
+                  isFirstLine &&
+                  lineEnd - lineStart >= 3 &&
+                  scratchBuf[lineStart] === 0xef &&
+                  scratchBuf[lineStart + 1] === 0xbb &&
+                  scratchBuf[lineStart + 2] === 0xbf
+                ) {
+                  lineStart += 3;
+                }
+                if (lineEnd > lineStart) {
+                  isFirstLine = false;
+                  const headerText = headerDecoder
+                    .decode(scratchBuf.subarray(lineStart, lineEnd))
+                    .trim();
+                  if (headerText) {
+                    cols = buildColumnIndexMap(splitCsvLine(headerText));
+                  }
+                }
+              } else if (lineEnd > lineStart) {
+                if (colCount < 32) {
+                  colStarts[colCount] = cStart;
+                  colEnds[colCount] = lineEnd;
+                  colCount += 1;
+                }
+                aggregator.ingestBinaryCsvLine(
+                  scratchBuf,
+                  colStarts,
+                  colEnds,
+                  colCount,
+                  cols,
+                  interner,
+                  hasQuotes
+                );
+              }
+
+              lineStart = i + 1;
+              cStart = lineStart;
+              colCount = 0;
+              hasQuotes = false;
+              inQuotes = false;
             }
-            lineStart = nlIdx + 1;
           }
 
-          leftover = lineStart < len ? text.slice(lineStart) : '';
-          emitProgress(fIdx, fIdx + 1, file.name);
+          // Preserve partial trailing line bytes in-place at index 0
+          leftoverLen = totalLen - lineStart;
+          if (leftoverLen > 0) {
+            scratchBuf.copyWithin(0, lineStart, totalLen);
+          }
+
+          offset = end;
+          bytesReadSoFar += stepBytes;
+          bytesSinceLastReport += stepBytes;
+
+          // Throttle UI progress posts to every 128 MB (avoid main-thread message flooding)
+          if (bytesSinceLastReport >= PROGRESS_REPORT_STEP_BYTES) {
+            bytesSinceLastReport = 0;
+            postProgress(fIdx, fIdx + 1, file.name);
+          }
         }
 
-        // Flush any remaining bytes from TextDecoder
-        const trailing = decoder.decode();
-        const finalText = leftover + trailing;
-        if (finalText.length > 0 && cols) {
-          aggregator.ingestCsvLineSlice(finalText, 0, finalText.length, cols);
+        // Process final line if file did not end with '\n'
+        if (leftoverLen > 0) {
+          let lineStart = 0;
+          let lineEnd = leftoverLen;
+          if (lineEnd > 0 && scratchBuf[lineEnd - 1] === 13) lineEnd -= 1;
+
+          if (
+            isFirstLine &&
+            lineEnd >= 3 &&
+            scratchBuf[0] === 0xef &&
+            scratchBuf[1] === 0xbb &&
+            scratchBuf[2] === 0xbf
+          ) {
+            lineStart = 3;
+          }
+
+          if (lineEnd > lineStart && cols) {
+            let colCount = 0;
+            let cStart = lineStart;
+            let hasQuotes = false;
+            let inQuotes = false;
+
+            for (let j = lineStart; j <= lineEnd; j += 1) {
+              if (j < lineEnd && scratchBuf[j] === 34) {
+                hasQuotes = true;
+                inQuotes = !inQuotes;
+              } else if (j === lineEnd || (scratchBuf[j] === 44 && !inQuotes)) {
+                if (colCount < 32) {
+                  colStarts[colCount] = cStart;
+                  colEnds[colCount] = j;
+                  colCount += 1;
+                }
+                cStart = j + 1;
+              }
+            }
+
+            aggregator.ingestBinaryCsvLine(
+              scratchBuf,
+              colStarts,
+              colEnds,
+              colCount,
+              cols,
+              interner,
+              hasQuotes
+            );
+          }
         }
 
-        emitProgress(fIdx + 1, fIdx + 1, file.name, true);
+        postProgress(fIdx + 1, fIdx + 1, file.name);
       } else if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
         const buffer = await file.arrayBuffer();
         bytesReadSoFar += file.size;
+        bytesSinceLastReport += file.size;
         const workbook = XLSX.read(buffer, { type: 'array' });
 
         for (const sheetName of workbook.SheetNames) {
@@ -127,7 +245,7 @@ self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
             aggregator.ingestObjectRow(row);
           }
         }
-        emitProgress(fIdx + 1, fIdx + 1, file.name, true);
+        postProgress(fIdx + 1, fIdx + 1, file.name);
       } else {
         throw new Error(
           `Định dạng tệp "${file.name}" không được hỗ trợ. Vui lòng dùng .csv hoặc .xlsx.`
@@ -142,11 +260,10 @@ self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
     }
 
     bytesReadSoFar = totalBytes;
-    emitProgress(
+    postProgress(
       files.length,
       files.length,
-      files[files.length - 1]?.name ?? '',
-      true
+      files[files.length - 1]?.name ?? ''
     );
 
     const label =
@@ -172,3 +289,4 @@ self.onmessage = async (event: MessageEvent<{ files: File[] }>) => {
     } satisfies WorkerResponseMessage);
   }
 };
+

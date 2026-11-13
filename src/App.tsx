@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AiKaizenPanel } from './components/AiKaizenPanel';
 import { DataInputPanel } from './components/DataInputPanel';
 import { FlowVisualizer } from './components/FlowVisualizer';
@@ -8,9 +8,13 @@ import { ProfitSimulatorSection } from './components/ProfitSimulatorSection';
 import { QuarterlyTrendsSection } from './components/QuarterlyTrendsSection';
 import { StationTable } from './components/StationTable';
 import { generateSampleSmeRows } from './data/samplePoloLine';
-import { analyzeLineWithGemini } from './services/geminiService';
+import {
+  analyzeLineWithGemini,
+  checkGeminiHealth,
+} from './services/geminiService';
 import type {
   AggregatedFactoryDataset,
+  GeminiHealthStatus,
   IngestionProgress,
   KaizenAiRecommendation,
   MarketSimulationInputs,
@@ -93,6 +97,33 @@ export function App() {
   const [optimizedSummary, setOptimizedSummary] = useState<QuarterSummary | null>(null);
   const [showVerification, setShowVerification] = useState(false);
   const [visualizerScenario, setVisualizerScenario] = useState<'before' | 'after'>('before');
+  const [geminiHealth, setGeminiHealth] = useState<GeminiHealthStatus>({
+    state: 'checking',
+    ok: false,
+    model: 'gemini-4-hydrogen',
+    latencyMs: 0,
+    message: 'Đang kiểm tra kết nối Gemini...',
+  });
+
+  const handleRefreshGeminiHealth = useCallback(async () => {
+    setGeminiHealth((prev) => ({
+      ...prev,
+      state: 'checking',
+      message: 'Đang kiểm tra kết nối Gemini...',
+    }));
+    const next = await checkGeminiHealth();
+    setGeminiHealth(next);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    checkGeminiHealth().then((status) => {
+      if (active) setGeminiHealth(status);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -353,6 +384,8 @@ export function App() {
         stageCount={activeSummary?.stages.length ?? 0}
         totalWorkers={activeSummary?.totalWorkers ?? 0}
         totalRowsProcessed={dataset?.totalRowsProcessed ?? 0}
+        geminiHealth={geminiHealth}
+        onRefreshGeminiHealth={handleRefreshGeminiHealth}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">

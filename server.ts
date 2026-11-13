@@ -1,13 +1,70 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { normalizeOptimizedStages } from './src/utils/simulationEngine.ts';
 import type { KaizenAiRecommendation, QuarterSummary } from './src/types/kaizen.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-4-hydrogen';
+
+function mapGeminiError(
+  err: unknown,
+  model: string
+): { httpStatus: number; message: string } {
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  const upper = raw.toUpperCase();
+
+  if (upper.includes('MISSING_KEY')) {
+    return {
+      httpStatus: 503,
+      message: 'Thiếu GEMINI_API_KEY trong .env',
+    };
+  }
+  if (upper.includes('400') || upper.includes('API_KEY_INVALID') || upper.includes('INVALID ARGUMENT')) {
+    return {
+      httpStatus: 400,
+      message: 'API Key không hợp lệ (400)',
+    };
+  }
+  if (upper.includes('403') || upper.includes('PERMISSION_DENIED')) {
+    return {
+      httpStatus: 403,
+      message: 'API Key không hợp lệ (403)',
+    };
+  }
+  if (upper.includes('429') || upper.includes('RESOURCE_EXHAUSTED') || upper.includes('QUOTA')) {
+    return {
+      httpStatus: 429,
+      message: 'Vượt giới hạn lượt gọi (429)',
+    };
+  }
+  if (upper.includes('404') || upper.includes('NOT_FOUND')) {
+    return {
+      httpStatus: 404,
+      message: `Model ${model} không khả dụng (404)`,
+    };
+  }
+  if (upper.includes('503') || upper.includes('UNAVAILABLE') || upper.includes('OVERLOADED')) {
+    return {
+      httpStatus: 503,
+      message: 'Dịch vụ Gemini tạm thời quá tải (503)',
+    };
+  }
+  if (upper.includes('FETCH') || upper.includes('ENOTFOUND') || upper.includes('ETIMEDOUT') || upper.includes('ABORT')) {
+    return {
+      httpStatus: 504,
+      message: 'Lỗi kết nối mạng',
+    };
+  }
+
+  return {
+    httpStatus: 500,
+    message: raw ? `Lỗi kết nối Gemini API: ${raw.slice(0, 140)}` : 'Lỗi kết nối mạng',
+  };
+}
 
 const SYSTEM_INSTRUCTION_VI = `Bạn là Chuyên gia Kỹ thuật Công nghiệp (IE - Industrial Engineering), Giám đốc Tài chính Xưởng May (CFO) và Chuyên gia Lean nhân văn cố vấn cho xưởng may gia công SME (50–100 công nhân).
 
@@ -128,7 +185,9 @@ const KAIZEN_RESPONSE_SCHEMA = {
 
 function createGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return null;
+  if (!apiKey || apiKey === 'your_gemini_api_key_here' || apiKey.length < 20) {
+    return null;
+  }
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -147,7 +206,62 @@ async function startServer() {
     res.json({
       ok: true,
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      model: GEMINI_MODEL,
     });
+  });
+
+  app.get('/api/gemini/health', async (_req, res) => {
+    const startMs = Date.now();
+    const ai = createGeminiClient();
+    if (!ai) {
+      res.json({
+        ok: false,
+        model: GEMINI_MODEL,
+        latencyMs: Date.now() - startMs,
+        message: 'Thiếu GEMINI_API_KEY trong .env',
+      });
+      return;
+    }
+
+    try {
+      let lastHealthError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: 'ping',
+            config: {
+              maxOutputTokens: 5,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+          lastHealthError = null;
+          break;
+        } catch (err: unknown) {
+          lastHealthError = err;
+          const mappedErr = mapGeminiError(err, GEMINI_MODEL);
+          if (mappedErr.httpStatus !== 503 || attempt === 1) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+      if (lastHealthError) throw lastHealthError;
+      res.json({
+        ok: true,
+        model: GEMINI_MODEL,
+        latencyMs: Date.now() - startMs,
+        message: `Đang hoạt động (${GEMINI_MODEL})`,
+      });
+    } catch (error: unknown) {
+      const mapped = mapGeminiError(error, GEMINI_MODEL);
+      res.json({
+        ok: false,
+        model: GEMINI_MODEL,
+        latencyMs: Date.now() - startMs,
+        message: mapped.message,
+      });
+    }
   });
 
   app.post('/api/kaizen/analyze', async (req, res) => {
@@ -165,8 +279,7 @@ async function startServer() {
       const ai = createGeminiClient();
       if (!ai) {
         res.status(503).json({
-          error:
-            'Chưa cấu hình GEMINI_API_KEY trên máy chủ. Vui lòng kiểm tra khóa API trong Settings > Secrets.',
+          error: 'Thiếu GEMINI_API_KEY trong .env',
         });
         return;
       }
@@ -178,12 +291,13 @@ ${JSON.stringify(compactSummary, null, 2)}
 Hãy phân tích Tổ nghẽn, Tổ lỗi cao, xu hướng hàng lỗi, giải pháp kỹ thuật/nhân sự, đồng thời giải thích rõ: (1) Chiến lược tối đa hóa lợi nhuận ròng theo bối cảnh đơn hàng & giá bán hiện tại, (2) Phân tách lợi nhuận từ mở khóa doanh thu mới vs. giảm lãng phí hàng lỗi, và (3) Cách bảo toàn sinh kế công nhân.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: userPrompt,
         config: {
           systemInstruction: SYSTEM_INSTRUCTION_VI,
           responseMimeType: 'application/json',
           responseSchema: KAIZEN_RESPONSE_SCHEMA,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
 
@@ -260,11 +374,10 @@ Hãy phân tích Tổ nghẽn, Tổ lỗi cao, xu hướng hàng lỗi, giải p
         optimizedSummary,
       });
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : 'Lỗi không xác định khi gọi Gemini AI.';
+      const mapped = mapGeminiError(error, GEMINI_MODEL);
       console.error('Gemini Kaizen analysis error:', error);
-      res.status(500).json({
-        error: `Không thể hoàn tất phân tích Gemini AI: ${message}`,
+      res.status(mapped.httpStatus).json({
+        error: mapped.message,
       });
     }
   });

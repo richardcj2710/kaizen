@@ -251,3 +251,12 @@ export interface VerificationMetrics {
     afterWip: number;
   }[];
 }
+
+export interface GeminiHealthStatus {
+  state: 'checking' | 'connected' | 'disconnected';
+  ok: boolean;
+  model: string;
+  latencyMs: number;
+  message: string;
+}
+

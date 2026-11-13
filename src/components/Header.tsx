@@ -1,5 +1,5 @@
-import { Cpu, Factory, Moon, Sun } from 'lucide-react';
-import type { ThemeMode } from '../types/kaizen';
+import { Factory, Moon, RefreshCw, Sun } from 'lucide-react';
+import type { GeminiHealthStatus, ThemeMode } from '../types/kaizen';
 
 interface HeaderProps {
   theme: ThemeMode;
@@ -7,6 +7,8 @@ interface HeaderProps {
   stageCount: number;
   totalWorkers: number;
   totalRowsProcessed: number;
+  geminiHealth: GeminiHealthStatus;
+  onRefreshGeminiHealth: () => void;
 }
 
 export function Header({
@@ -15,8 +17,34 @@ export function Header({
   stageCount,
   totalWorkers,
   totalRowsProcessed,
+  geminiHealth,
+  onRefreshGeminiHealth,
 }: HeaderProps) {
   const isDark = theme === 'dark';
+  const isChecking = geminiHealth.state === 'checking';
+  const isConnected = geminiHealth.state === 'connected';
+
+  const statusClasses = isChecking
+    ? 'bg-amber-50 dark:bg-amber-950/50 border-amber-200 dark:border-amber-800/80 text-amber-800 dark:text-amber-200'
+    : isConnected
+      ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800/80 text-emerald-800 dark:text-emerald-200'
+      : 'bg-red-50 dark:bg-red-950/50 border-red-200 dark:border-red-800/80 text-red-800 dark:text-red-200';
+
+  const dotClasses = isChecking
+    ? 'bg-amber-500 animate-pulse'
+    : isConnected
+      ? 'bg-emerald-500'
+      : 'bg-red-500';
+
+  const statusText = isChecking
+    ? 'Đang kiểm tra kết nối Gemini...'
+    : isConnected
+      ? `Gemini AI: Đang hoạt động (${geminiHealth.model})`
+      : 'Gemini AI: Mất kết nối';
+
+  const statusTitle = isConnected
+    ? `${geminiHealth.message} · Độ trễ ${geminiHealth.latencyMs}ms`
+    : geminiHealth.message;
 
   return (
     <header className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors">
@@ -43,10 +71,50 @@ export function Header({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 shrink-0">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-blue-50 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-800 text-blue-800 dark:text-blue-200 text-xs font-semibold whitespace-nowrap">
-            <Cpu className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-            <span>Sẵn sàng kết nối Gemini AI</span>
+        <div className="flex flex-wrap items-center gap-2.5 max-w-full">
+          <div
+            data-testid="gemini-status-badge"
+            data-status={geminiHealth.state}
+            title={statusTitle}
+            role="status"
+            aria-live="polite"
+            className={`inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors max-w-full ${statusClasses}`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${dotClasses}`}
+              aria-hidden="true"
+            />
+            <span className="break-words">{statusText}</span>
+
+            {geminiHealth.state === 'disconnected' && geminiHealth.message && (
+              <span
+                data-testid="gemini-status-reason"
+                className="text-[11px] font-medium opacity-90 border-l border-red-300 dark:border-red-700 pl-2 break-words"
+              >
+                {geminiHealth.message}
+              </span>
+            )}
+
+            {isConnected && geminiHealth.latencyMs > 0 && (
+              <span className="text-[11px] font-mono opacity-80 hidden sm:inline tabular-nums">
+                {geminiHealth.latencyMs}ms
+              </span>
+            )}
+
+            <button
+              type="button"
+              onClick={onRefreshGeminiHealth}
+              disabled={isChecking}
+              data-testid="gemini-recheck-btn"
+              title="Kiểm tra lại kết nối Gemini AI"
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-current/25 bg-white/60 dark:bg-slate-900/40 hover:bg-white dark:hover:bg-slate-900/70 text-[11px] font-semibold transition-colors disabled:opacity-60 whitespace-nowrap"
+            >
+              <RefreshCw
+                className={`w-3 h-3 shrink-0 ${isChecking ? 'animate-spin' : ''}`}
+                aria-hidden="true"
+              />
+              <span>Kiểm tra lại</span>
+            </button>
           </div>
 
           <button

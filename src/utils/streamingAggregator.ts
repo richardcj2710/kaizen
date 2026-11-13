@@ -45,7 +45,6 @@ interface TeamAccumulator {
   teamName: string;
   rowCount: number;
   hasWorkerIds: boolean;
-  uniqueWorkers: Set<string>;
   workerStats: Map<string, WorkerAccumulator>;
   declaredWorkersMax: number;
   smvSum: number;
@@ -151,6 +150,121 @@ export function parseNum(raw: unknown, fallback = 0): number {
     return Number.isFinite(val) ? val : fallback;
   }
   return fallback;
+}
+
+/**
+ * Direct ASCII byte number parser (zero string allocation).
+ * Handles optional leading +/-, integer & fractional digits, and ignores whitespace or trailing '%'.
+ */
+export function parseNumberBytes(
+  buf: Uint8Array,
+  start: number,
+  end: number,
+  fallback = 0
+): number {
+  let s = start;
+  let e = end;
+  while (s < e && buf[s] <= 32) s += 1;
+  while (e > s && (buf[e - 1] <= 32 || buf[e - 1] === 37)) e -= 1; // trim whitespace & '%'
+  if (s >= e) return fallback;
+
+  let sign = 1;
+  if (buf[s] === 45) {
+    sign = -1;
+    s += 1;
+  } else if (buf[s] === 43) {
+    s += 1;
+  }
+  if (s >= e) return fallback;
+
+  let intPart = 0;
+  let fracPart = 0;
+  let fracDiv = 1;
+  let inFrac = false;
+  let hasDigit = false;
+
+  for (let i = s; i < e; i += 1) {
+    const c = buf[i];
+    if (c === 46 || c === 44) {
+      if (inFrac) break;
+      inFrac = true;
+    } else if (c >= 48 && c <= 57) {
+      hasDigit = true;
+      const digit = c - 48;
+      if (inFrac) {
+        fracPart = fracPart * 10 + digit;
+        fracDiv *= 10;
+      } else {
+        intPart = intPart * 10 + digit;
+      }
+    } else if (c > 32) {
+      // Unexpected non-numeric character
+      return fallback;
+    }
+  }
+
+  return hasDigit ? sign * (intPart + fracPart / fracDiv) : fallback;
+}
+
+interface InternEntry {
+  bytes: Uint8Array;
+  value: string;
+}
+
+/**
+ * Collision-safe FNV-1a byte-slice string interner.
+ * Calls TextDecoder.decode() only once per unique byte sequence across 70M+ rows.
+ */
+export class ByteStringInterner {
+  private cache = new Map<number, InternEntry>();
+  private decoder = new TextDecoder('utf-8');
+  private readonly maxEntries: number;
+
+  constructor(maxEntries = 50000) {
+    this.maxEntries = maxEntries;
+  }
+
+  get size(): number {
+    return this.cache.size;
+  }
+
+  decodeCached(buf: Uint8Array, start: number, end: number): string {
+    let s = start;
+    let e = end;
+    while (s < e && (buf[s] === 32 || buf[s] === 13 || buf[s] === 9)) s += 1;
+    while (e > s && (buf[e - 1] === 32 || buf[e - 1] === 13 || buf[e - 1] === 9)) e -= 1;
+    if (s >= e) return '';
+
+    const len = e - s;
+    let hash = 2166136261;
+    for (let i = s; i < e; i += 1) {
+      hash ^= buf[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    const key = (hash ^ (len << 16)) >>> 0;
+
+    const existing = this.cache.get(key);
+    if (existing && existing.bytes.length === len) {
+      let match = true;
+      const eb = existing.bytes;
+      for (let i = 0; i < len; i += 1) {
+        if (eb[i] !== buf[s + i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return existing.value;
+    }
+
+    const decoded = this.decoder.decode(buf.subarray(s, e));
+    if (!existing && this.cache.size < this.maxEntries) {
+      this.cache.set(key, {
+        bytes: buf.slice(s, e),
+        value: decoded,
+      });
+    }
+    return decoded;
+  }
 }
 
 export function inferStageId(rawId: string, stageName: string, fallbackIndex: number): string {
@@ -372,16 +486,416 @@ export function buildColumnIndexMap(headers: string[]): ColumnIndexMap {
 
 export class StreamingKaizenAggregator {
   private teamBuckets = new Map<string, TeamAccumulator>();
+  // 3-level nested lookup (quarter -> stageId -> teamName) avoids per-row template strings
+  private bucketTree = new Map<string, Map<string, Map<string, TeamAccumulator>>>();
+  private quarterCache = new Map<string, QuarterId>();
   private stageOrder = new Map<string, number>();
   private stageIdCache = new Map<string, string>();
+  private lastBucket: TeamAccumulator | null = null;
+  private lastBucketQuarter = '';
+  private lastBucketStageId = '';
+  private lastBucketTeamName = '';
+  private quarterByNamMap = new Map<number, Map<string, QuarterId>>();
   private nextStageSeq = 1;
   private totalRows = 0;
 
-  // Reusable flat field buffer for zero-allocation CSV scanning (70M+ rows)
+  // Reusable flat field buffer for text-slice fallback
   private reusableFields: string[] = new Array(32).fill('');
+  private binaryFallbackDecoder = new TextDecoder('utf-8');
 
   get rowCount(): number {
     return this.totalRows;
+  }
+
+  private getOrCreateBucket(
+    quarter: QuarterId,
+    stageId: string,
+    stageName: string,
+    teamName: string
+  ): TeamAccumulator {
+    const lb = this.lastBucket;
+    if (
+      lb !== null &&
+      this.lastBucketQuarter === quarter &&
+      this.lastBucketStageId === stageId &&
+      this.lastBucketTeamName === teamName
+    ) {
+      return lb;
+    }
+
+    let stageMap = this.bucketTree.get(quarter);
+    if (!stageMap) {
+      stageMap = new Map();
+      this.bucketTree.set(quarter, stageMap);
+    }
+    let teamMap = stageMap.get(stageId);
+    if (!teamMap) {
+      teamMap = new Map();
+      stageMap.set(stageId, teamMap);
+    }
+    let bucket = teamMap.get(teamName);
+    if (!bucket) {
+      bucket = {
+        quarter,
+        stageId,
+        stageName,
+        teamName,
+        rowCount: 0,
+        hasWorkerIds: false,
+        workerStats: new Map<string, WorkerAccumulator>(),
+        declaredWorkersMax: 0,
+        smvSum: 0,
+        effSum: 0,
+        wipSum: 0,
+        totalOutputUnits: 0,
+        totalDefectUnits: 0,
+        defectRateSum: 0,
+        wageSum: 0,
+        equipCostSum: 0,
+        unitPriceSum: 0,
+        unitPriceCount: 0,
+        materialCostSum: 0,
+        materialCostCount: 0,
+        teamDemandMax: 0,
+        marketContext: '',
+        techHints: new Set<string>(),
+      };
+      teamMap.set(teamName, bucket);
+      this.teamBuckets.set(`${quarter}::${stageId}::${teamName}`, bucket);
+    }
+
+    this.lastBucket = bucket;
+    this.lastBucketQuarter = quarter;
+    this.lastBucketStageId = stageId;
+    this.lastBucketTeamName = teamName;
+    return bucket;
+  }
+
+  private resolveStageId(rawStageId: string, stageName: string): string {
+    // Zero-allocation fast path when standard CDx ID is already supplied
+    if (
+      rawStageId.length >= 3 &&
+      rawStageId.length <= 4 &&
+      rawStageId.charCodeAt(0) === 67 &&
+      rawStageId.charCodeAt(1) === 68
+    ) {
+      return rawStageId;
+    }
+
+    const stageMap = this.stageIdCache;
+    const lookupKey = rawStageId ? `${rawStageId}|${stageName}` : stageName;
+    let stageId = stageMap.get(lookupKey);
+    if (!stageId) {
+      const stageKeyNorm = normalizeHeaderName(stageName);
+      if (!this.stageOrder.has(stageKeyNorm)) {
+        this.stageOrder.set(stageKeyNorm, this.nextStageSeq);
+        this.nextStageSeq += 1;
+      }
+      stageId = inferStageId(
+        rawStageId,
+        stageName,
+        this.stageOrder.get(stageKeyNorm) ?? 1
+      );
+      stageMap.set(lookupKey, stageId);
+    }
+    return stageId;
+  }
+
+  private resolveQuarterFastBinary(
+    rawQuy: string,
+    namNum: number,
+    rawTs: string
+  ): QuarterId {
+    // Zero-allocation fast path for 'YYYY-Qx' (e.g., '2025-Q3')
+    if (
+      rawQuy.length === 7 &&
+      rawQuy.charCodeAt(4) === 45 &&
+      rawQuy.charCodeAt(5) === 81 &&
+      rawQuy.charCodeAt(6) >= 49 &&
+      rawQuy.charCodeAt(6) <= 52
+    ) {
+      return rawQuy;
+    }
+    if (rawTs.length === 0) {
+      let byQuy = this.quarterByNamMap.get(namNum);
+      if (!byQuy) {
+        byQuy = new Map();
+        this.quarterByNamMap.set(namNum, byQuy);
+      }
+      let q = byQuy.get(rawQuy);
+      if (!q) {
+        q = parseQuarterValue(rawQuy, namNum > 0 ? namNum : '', '');
+        if (byQuy.size < 256) byQuy.set(rawQuy, q);
+      }
+      return q;
+    }
+    return this.resolveQuarterCached(rawQuy, namNum > 0 ? namNum : '', rawTs);
+  }
+
+  private resolveQuarterCached(
+    rawQuy: string,
+    rawNam: string | number,
+    rawTs: string
+  ): QuarterId {
+    const cacheKey = `${rawNam}|${rawQuy}|${rawTs}`;
+    let q = this.quarterCache.get(cacheKey);
+    if (!q) {
+      q = parseQuarterValue(rawQuy, rawNam, rawTs);
+      if (this.quarterCache.size < 10000) {
+        this.quarterCache.set(cacheKey, q);
+      }
+    }
+    return q;
+  }
+
+  private recordBucketRowDirect(
+    quarter: QuarterId,
+    stageId: string,
+    stageName: string,
+    teamName: string,
+    workerId: string,
+    soLaoDong: number,
+    smv: number,
+    eff: number,
+    wip: number,
+    shiftOut: number,
+    defectUnits: number,
+    defectRate: number,
+    wage: number,
+    equipCost: number,
+    tech: string,
+    unitPrice: number,
+    materialCost: number,
+    teamDemand: number,
+    marketContext: string
+  ): void {
+    const bucket = this.getOrCreateBucket(quarter, stageId, stageName, teamName);
+
+    bucket.rowCount += 1;
+    bucket.smvSum += smv;
+    bucket.effSum += eff;
+    bucket.wipSum += wip;
+    bucket.totalOutputUnits += shiftOut;
+    bucket.totalDefectUnits += defectUnits;
+    bucket.defectRateSum += defectRate;
+    bucket.wageSum += wage;
+    bucket.equipCostSum += equipCost;
+    if (unitPrice > 0) {
+      bucket.unitPriceSum += unitPrice;
+      bucket.unitPriceCount += 1;
+    }
+    if (materialCost > 0) {
+      bucket.materialCostSum += materialCost;
+      bucket.materialCostCount += 1;
+    }
+    if (teamDemand > bucket.teamDemandMax) {
+      bucket.teamDemandMax = teamDemand;
+    }
+    if (marketContext && !bucket.marketContext) {
+      bucket.marketContext = marketContext;
+    }
+    if (tech && tech !== 'Không' && tech !== 'không') {
+      bucket.techHints.add(tech);
+    }
+
+    if (workerId) {
+      bucket.hasWorkerIds = true;
+      let ws = bucket.workerStats.get(workerId);
+      if (!ws) {
+        ws = {
+          workerId,
+          effWeightedSum: 0,
+          effWeight: 0,
+          defectUnits: 0,
+          totalUnits: 0,
+          defectRateSum: 0,
+          rowCount: 0,
+        };
+        bucket.workerStats.set(workerId, ws);
+      }
+      ws.effWeightedSum += eff;
+      ws.effWeight += 1;
+      ws.defectUnits += defectUnits;
+      ws.totalUnits += shiftOut;
+      ws.defectRateSum += defectRate;
+      ws.rowCount += 1;
+    } else if (soLaoDong > bucket.declaredWorkersMax) {
+      bucket.declaredWorkersMax = soLaoDong;
+    }
+
+    this.totalRows += 1;
+  }
+
+  /**
+   * Zero-allocation binary CSV line ingestion using raw byte boundaries in Int32Array,
+   * direct ASCII numeric parsing, and FNV-1a interned string caching.
+   */
+  ingestBinaryCsvLine(
+    buf: Uint8Array,
+    colStarts: Int32Array,
+    colEnds: Int32Array,
+    colCount: number,
+    cols: ColumnIndexMap,
+    interner: ByteStringInterner,
+    hasQuotes = false
+  ): void {
+    if (colCount <= 0) return;
+    if (hasQuotes) {
+      const lineStr = this.binaryFallbackDecoder.decode(
+        buf.subarray(colStarts[0], colEnds[colCount - 1])
+      );
+      this.ingestRowValues(splitCsvLine(lineStr), cols);
+      return;
+    }
+
+    const rawStageName =
+      cols.tenCongDoan >= 0 && cols.tenCongDoan < colCount
+        ? interner.decodeCached(buf, colStarts[cols.tenCongDoan], colEnds[cols.tenCongDoan])
+        : '';
+    const rawStageId =
+      cols.id >= 0 && cols.id < colCount
+        ? interner.decodeCached(buf, colStarts[cols.id], colEnds[cols.id])
+        : '';
+    if (!rawStageName && !rawStageId) return;
+
+    const stageName = rawStageName || rawStageId;
+    const stageId = this.resolveStageId(rawStageId, stageName);
+
+    const rawQuy =
+      cols.quy >= 0 && cols.quy < colCount
+        ? interner.decodeCached(buf, colStarts[cols.quy], colEnds[cols.quy])
+        : '';
+    const namNum =
+      cols.nam >= 0 && cols.nam < colCount
+        ? Math.round(parseNumberBytes(buf, colStarts[cols.nam], colEnds[cols.nam], 0))
+        : 0;
+    const rawTs =
+      cols.timestamp >= 0 && cols.timestamp < colCount
+        ? interner.decodeCached(buf, colStarts[cols.timestamp], colEnds[cols.timestamp])
+        : '';
+    const quarter = this.resolveQuarterFastBinary(rawQuy, namNum, rawTs);
+
+    const rawTeam =
+      cols.toSanXuat >= 0 && cols.toSanXuat < colCount
+        ? interner.decodeCached(buf, colStarts[cols.toSanXuat], colEnds[cols.toSanXuat])
+        : '';
+    const teamName = rawTeam || `Tổ ${stageId}`;
+
+    const workerId =
+      cols.maCongNhan >= 0 && cols.maCongNhan < colCount
+        ? interner.decodeCached(buf, colStarts[cols.maCongNhan], colEnds[cols.maCongNhan])
+        : '';
+
+    const soLaoDong =
+      cols.soLaoDong >= 0 && cols.soLaoDong < colCount
+        ? Math.max(1, Math.round(parseNumberBytes(buf, colStarts[cols.soLaoDong], colEnds[cols.soLaoDong], 1)))
+        : 1;
+
+    const smv =
+      cols.tgSmv >= 0 && cols.tgSmv < colCount
+        ? Math.max(0.1, parseNumberBytes(buf, colStarts[cols.tgSmv], colEnds[cols.tgSmv], 1.0))
+        : 1.0;
+
+    const actualSec =
+      cols.tgThucTeGiay >= 0 && cols.tgThucTeGiay < colCount
+        ? parseNumberBytes(buf, colStarts[cols.tgThucTeGiay], colEnds[cols.tgThucTeGiay], 0)
+        : 0;
+
+    let eff =
+      cols.hieuSuatTb >= 0 && cols.hieuSuatTb < colCount
+        ? parseNumberBytes(buf, colStarts[cols.hieuSuatTb], colEnds[cols.hieuSuatTb], 0)
+        : 0;
+    if (eff > 0 && eff <= 1) eff = eff * 100;
+    if (eff <= 0 && actualSec > 0) {
+      eff = ((smv * 60) / actualSec) * 100;
+    }
+    if (eff <= 0) eff = 58;
+    eff = Math.min(100, Math.max(10, eff));
+
+    const wip =
+      cols.wip >= 0 && cols.wip < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.wip], colEnds[cols.wip], 0))
+        : 0;
+
+    const shiftOut =
+      cols.sanLuongCa >= 0 && cols.sanLuongCa < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.sanLuongCa], colEnds[cols.sanLuongCa], 0))
+        : Math.max(1, Math.round((60 / smv) * (eff / 100) * 8));
+
+    let defectRate =
+      cols.tyLeLoi >= 0 && cols.tyLeLoi < colCount
+        ? parseNumberBytes(buf, colStarts[cols.tyLeLoi], colEnds[cols.tyLeLoi], -1)
+        : -1;
+    if (defectRate > 0 && defectRate < 0.25 && cols.soHangLoi < 0) {
+      defectRate = defectRate * 100;
+    }
+    const defectUnits =
+      cols.soHangLoi >= 0 && cols.soHangLoi < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.soHangLoi], colEnds[cols.soHangLoi], 0))
+        : defectRate >= 0
+          ? Math.round((shiftOut * defectRate) / 100)
+          : 0;
+
+    if (defectRate < 0) {
+      defectRate = shiftOut > 0 ? (defectUnits / shiftOut) * 100 : 0;
+    }
+
+    const wage =
+      cols.luongThang >= 0 && cols.luongThang < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.luongThang], colEnds[cols.luongThang], 7800000))
+        : 7800000;
+
+    const equipCost =
+      cols.chiPhiThietBi >= 0 && cols.chiPhiThietBi < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.chiPhiThietBi], colEnds[cols.chiPhiThietBi], 0))
+        : 0;
+
+    const tech =
+      cols.giaiPhapKyThuat >= 0 && cols.giaiPhapKyThuat < colCount
+        ? interner.decodeCached(buf, colStarts[cols.giaiPhapKyThuat], colEnds[cols.giaiPhapKyThuat])
+        : '';
+
+    const unitPrice =
+      cols.donGiaBan >= 0 && cols.donGiaBan < colCount
+        ? parseNumberBytes(buf, colStarts[cols.donGiaBan], colEnds[cols.donGiaBan], 0)
+        : 0;
+
+    const materialCost =
+      cols.chiPhiNvlSp >= 0 && cols.chiPhiNvlSp < colCount
+        ? parseNumberBytes(buf, colStarts[cols.chiPhiNvlSp], colEnds[cols.chiPhiNvlSp], 0)
+        : 0;
+
+    const teamDemand =
+      cols.nhuCauDonHangTo >= 0 && cols.nhuCauDonHangTo < colCount
+        ? Math.max(0, parseNumberBytes(buf, colStarts[cols.nhuCauDonHangTo], colEnds[cols.nhuCauDonHangTo], 0))
+        : 0;
+
+    const marketContext =
+      cols.boiCanhThiTruong >= 0 && cols.boiCanhThiTruong < colCount
+        ? interner.decodeCached(buf, colStarts[cols.boiCanhThiTruong], colEnds[cols.boiCanhThiTruong])
+        : '';
+
+    this.recordBucketRowDirect(
+      quarter,
+      stageId,
+      stageName,
+      teamName,
+      workerId,
+      soLaoDong,
+      smv,
+      eff,
+      wip,
+      shiftOut,
+      defectUnits,
+      defectRate,
+      wage,
+      equipCost,
+      tech,
+      unitPrice,
+      materialCost,
+      teamDemand,
+      marketContext
+    );
   }
 
   /**
@@ -394,7 +908,6 @@ export class StreamingKaizenAggregator {
     lineEnd: number,
     cols: ColumnIndexMap
   ): void {
-    // Trim leading whitespace/BOM & trailing CR/whitespace via charCodeAt
     let start = lineStart;
     let end = lineEnd;
     if (start < end && text.charCodeAt(start) === 0xfeff) start += 1;
@@ -424,7 +937,6 @@ export class StreamingKaizenAggregator {
       pos = commaIdx + 1;
     }
 
-    // Clear trailing stale entries if line has fewer columns
     for (let k = colIdx; k <= cols.maxColIndex && k < 32; k += 1) {
       buf[k] = '';
     }
@@ -439,26 +951,12 @@ export class StreamingKaizenAggregator {
     if (!rawStageName && !rawStageId) return;
 
     const stageName = rawStageName || rawStageId;
-    const cacheKey = `${rawStageId}::${stageName}`;
-    let stageId = this.stageIdCache.get(cacheKey);
-    if (!stageId) {
-      const stageKeyNorm = normalizeHeaderName(stageName);
-      if (!this.stageOrder.has(stageKeyNorm)) {
-        this.stageOrder.set(stageKeyNorm, this.nextStageSeq);
-        this.nextStageSeq += 1;
-      }
-      stageId = inferStageId(
-        rawStageId,
-        stageName,
-        this.stageOrder.get(stageKeyNorm) ?? 1
-      );
-      this.stageIdCache.set(cacheKey, stageId);
-    }
+    const stageId = this.resolveStageId(rawStageId, stageName);
 
-    const rawQuy = cols.quy >= 0 ? values[cols.quy] : '';
-    const rawNam = cols.nam >= 0 ? values[cols.nam] : '';
-    const rawTs = cols.timestamp >= 0 ? values[cols.timestamp] : '';
-    const quarter = parseQuarterValue(rawQuy, rawNam, rawTs);
+    const rawQuy = cols.quy >= 0 ? String(values[cols.quy] ?? '') : '';
+    const rawNam = cols.nam >= 0 ? (values[cols.nam] as string | number) : '';
+    const rawTs = cols.timestamp >= 0 ? String(values[cols.timestamp] ?? '') : '';
+    const quarter = this.resolveQuarterCached(rawQuy, rawNam, rawTs);
 
     const teamName =
       cols.toSanXuat >= 0 && String(values[cols.toSanXuat] ?? '').trim()
@@ -524,94 +1022,27 @@ export class StreamingKaizenAggregator {
         ? String(values[cols.boiCanhThiTruong] ?? '').trim()
         : '';
 
-    const bucketKey = `${quarter}::${stageId}::${teamName}`;
-    let bucket = this.teamBuckets.get(bucketKey);
-    if (!bucket) {
-      bucket = {
-        quarter,
-        stageId,
-        stageName,
-        teamName,
-        rowCount: 0,
-        hasWorkerIds: false,
-        uniqueWorkers: new Set<string>(),
-        workerStats: new Map<string, WorkerAccumulator>(),
-        declaredWorkersMax: 0,
-        smvSum: 0,
-        effSum: 0,
-        wipSum: 0,
-        totalOutputUnits: 0,
-        totalDefectUnits: 0,
-        defectRateSum: 0,
-        wageSum: 0,
-        equipCostSum: 0,
-        unitPriceSum: 0,
-        unitPriceCount: 0,
-        materialCostSum: 0,
-        materialCostCount: 0,
-        teamDemandMax: 0,
-        marketContext: '',
-        techHints: new Set<string>(),
-      };
-      this.teamBuckets.set(bucketKey, bucket);
-    }
-
-    bucket.rowCount += 1;
-    bucket.smvSum += smv;
-    bucket.effSum += eff;
-    bucket.wipSum += wip;
-    bucket.totalOutputUnits += shiftOut;
-    bucket.totalDefectUnits += defectUnits;
-    bucket.defectRateSum += defectRate;
-    bucket.wageSum += wage;
-    bucket.equipCostSum += equipCost;
-    if (unitPrice > 0) {
-      bucket.unitPriceSum += unitPrice;
-      bucket.unitPriceCount += 1;
-    }
-    if (materialCost > 0) {
-      bucket.materialCostSum += materialCost;
-      bucket.materialCostCount += 1;
-    }
-    if (teamDemand > bucket.teamDemandMax) {
-      bucket.teamDemandMax = teamDemand;
-    }
-    if (marketContext && !bucket.marketContext) {
-      bucket.marketContext = marketContext;
-    }
-    if (tech && tech.toLowerCase() !== 'không') {
-      bucket.techHints.add(tech);
-    }
-
-    if (workerId) {
-      bucket.hasWorkerIds = true;
-      bucket.uniqueWorkers.add(workerId);
-
-      // Bounded to factory worker headcount (50–100 workers)
-      let ws = bucket.workerStats.get(workerId);
-      if (!ws) {
-        ws = {
-          workerId,
-          effWeightedSum: 0,
-          effWeight: 0,
-          defectUnits: 0,
-          totalUnits: 0,
-          defectRateSum: 0,
-          rowCount: 0,
-        };
-        bucket.workerStats.set(workerId, ws);
-      }
-      ws.effWeightedSum += eff;
-      ws.effWeight += 1;
-      ws.defectUnits += defectUnits;
-      ws.totalUnits += shiftOut;
-      ws.defectRateSum += defectRate;
-      ws.rowCount += 1;
-    } else {
-      bucket.declaredWorkersMax = Math.max(bucket.declaredWorkersMax, soLaoDong);
-    }
-
-    this.totalRows += 1;
+    this.recordBucketRowDirect(
+      quarter,
+      stageId,
+      stageName,
+      teamName,
+      workerId,
+      soLaoDong,
+      smv,
+      eff,
+      wip,
+      shiftOut,
+      defectUnits,
+      defectRate,
+      wage,
+      equipCost,
+      tech,
+      unitPrice,
+      materialCost,
+      teamDemand,
+      marketContext
+    );
   }
 
   ingestObjectRow(row: Record<string, unknown>): void {
@@ -633,7 +1064,7 @@ export class StreamingKaizenAggregator {
       }
 
       const workerCount = bucket.hasWorkerIds
-        ? bucket.uniqueWorkers.size
+        ? bucket.workerStats.size
         : Math.max(1, bucket.declaredWorkersMax);
 
       const weightedSmv = Number((bucket.smvSum / bucket.rowCount).toFixed(2));
@@ -839,7 +1270,7 @@ export class StreamingKaizenAggregator {
       for (const b of this.teamBuckets.values()) {
         if (b.quarter === quarter && b.stageId === stageId) {
           equipCost += b.hasWorkerIds
-            ? Math.round((b.equipCostSum / Math.max(1, b.rowCount)) * b.uniqueWorkers.size)
+            ? Math.round((b.equipCostSum / Math.max(1, b.rowCount)) * b.workerStats.size)
             : Math.round(b.equipCostSum / Math.max(1, b.rowCount));
           b.techHints.forEach((h) => techs.add(h));
         }
