@@ -25,6 +25,7 @@ Tại các xưởng may gia công vừa và nhỏ, khu vực sản xuất trực
 ## 4. Tiến độ triển khai (Hackathon)
 
 - [x] Chuẩn bị khung dự án, dữ liệu mẫu chuẩn SMV ngành may & tài liệu thiết kế (Prep < 30%)
+- [x] Reconfig codespaces
 - [ ] Module đọc file Excel & Engine mô phỏng năng suất chuyền may
 - [ ] Tích hợp Gemini API đề xuất cân bằng chuyền & gá cữ kỹ thuật
 - [ ] Giao diện trực quan hóa biểu đồ Trước / Sau
