@@ -5,11 +5,43 @@
 @layer base {
   html {
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-    color: #0f172a;
-    background-color: #f8fafc;
   }
 
   .tabular-nums {
     font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes flowParticle {
+  0% {
+    transform: translate3d(0, 0, 0);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate3d(42px, 0, 0);
+    opacity: 0;
+  }
+}
+
+.flow-dot-x {
+  animation-name: flowParticle;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform, opacity;
+}
+
+.flow-paused .flow-dot-x {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-dot-x {
+    animation: none;
   }
 }
